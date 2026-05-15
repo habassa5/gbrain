@@ -11,6 +11,8 @@
  *   pathToSlug()  →  convert file paths to page slugs
  */
 
+import { CJK_SLUG_CHARS } from './cjk.ts';
+
 export interface SyncManifest {
   added: string[];
   modified: string[];
@@ -130,14 +132,44 @@ export function isCodeFilePath(path: string): boolean {
   return false;
 }
 
-function isMarkdownFilePath(path: string): boolean {
+/**
+ * v0.27.1: image extensions are admitted only when the multimodal config
+ * gate is on. The runtime gate flips through `process.env.GBRAIN_EMBEDDING_MULTIMODAL`
+ * which loadConfigWithEngine populates from the DB plane after engine connect
+ * (or env directly when the operator overrides). When the gate is off,
+ * existing brains keep their current "markdown + code only" sync behavior.
+ */
+export function isImageFilePath(path: string): boolean {
+  const lower = path.toLowerCase();
+  return (
+    lower.endsWith('.png') ||
+    lower.endsWith('.jpg') ||
+    lower.endsWith('.jpeg') ||
+    lower.endsWith('.gif') ||
+    lower.endsWith('.webp') ||
+    lower.endsWith('.heic') ||
+    lower.endsWith('.heif') ||
+    lower.endsWith('.avif')
+  );
+}
+
+export function isMarkdownFilePath(path: string): boolean {
   return path.endsWith('.md') || path.endsWith('.mdx');
+}
+
+function isMultimodalEnabled(): boolean {
+  return process.env.GBRAIN_EMBEDDING_MULTIMODAL === 'true';
 }
 
 function isAllowedByStrategy(path: string, strategy: SyncStrategy): boolean {
   if (strategy === 'markdown') return isMarkdownFilePath(path);
   if (strategy === 'code') return isCodeFilePath(path);
-  return isMarkdownFilePath(path) || isCodeFilePath(path);
+  // 'auto' / default: markdown + code, plus images when multimodal is on.
+  return (
+    isMarkdownFilePath(path) ||
+    isCodeFilePath(path) ||
+    (isMultimodalEnabled() && isImageFilePath(path))
+  );
 }
 
 function globToRegex(pattern: string): RegExp {
@@ -206,14 +238,33 @@ export function isSyncable(path: string, opts: SyncableOptions = {}): boolean {
 }
 
 /**
- * Slugify a single path segment: lowercase, strip special chars, spaces → hyphens.
+ * Character class for the lowercase-canonical form of a slug segment after
+ * slugifySegment() has run. Lowercase letters, digits, dots, underscores,
+ * hyphens. Exposed so adjacent code (e.g. takes-fence holder validation,
+ * v0.32 EXP-4) can reuse the actual repo slug grammar instead of inventing
+ * a stricter parallel one and emitting false-positive warnings on legitimate
+ * `companies/acme.io` / `people/foo_bar` slugs (codex review #3).
+ *
+ * Pattern is the inner character class only (no anchors); callers wrap it
+ * in `^...$` or compose it with prefixes like `(?:people|companies)/...`.
  */
+export const SLUG_SEGMENT_PATTERN = new RegExp(`[a-z0-9._\\-${CJK_SLUG_CHARS}]+`);
+
+/**
+ * Slugify a single path segment: lowercase, strip special chars, spaces → hyphens.
+ * CJK ranges (Han / Hiragana / Katakana / Hangul Syllables) are preserved (v0.32.7).
+ * NFC re-normalize after the NFD-strip-accents pass so Hangul Jamo recomposes back
+ * into precomposed syllables that fall inside the whitelist.
+ */
+const SLUGIFY_KEEP_RE = new RegExp(`[^a-z0-9.\\s_\\-${CJK_SLUG_CHARS}]`, 'g');
+
 export function slugifySegment(segment: string): string {
   return segment
     .normalize('NFD')                     // Decompose accented chars
     .replace(/[\u0300-\u036f]/g, '')      // Strip accent marks
+    .normalize('NFC')                     // Recompose Hangul Jamo back to Syllables (v0.32.7)
     .toLowerCase()
-    .replace(/[^a-z0-9.\s_-]/g, '')      // Keep alphanumeric, dots, spaces, underscores, hyphens
+    .replace(SLUGIFY_KEEP_RE, '')         // Keep alnum, dots, spaces, _-, and CJK (v0.32.7)
     .replace(/[\s]+/g, '-')              // Spaces → hyphens
     .replace(/-+/g, '-')                 // Collapse multiple hyphens
     .replace(/^-|-$/g, '');              // Strip leading/trailing hyphens
@@ -365,6 +416,18 @@ export function classifyErrorCode(errorMsg: string): string {
   // (lines 199, 347, 352, 401) that previously bucketed to UNKNOWN.
   if (/file too large|content too large|FILE_TOO_LARGE/i.test(errorMsg)) return 'FILE_TOO_LARGE';
   if (/skipping symlink|symlink|SYMLINK_NOT_ALLOWED/i.test(errorMsg)) return 'SYMLINK_NOT_ALLOWED';
+
+  // v0.32 takes-v2 additions: malformed fence rows + holder-grammar failures.
+  // TAKES_TABLE_MALFORMED and TAKES_ROW_NUM_COLLISION are produced by
+  // parseTakesFence (src/core/takes-fence.ts); TAKES_HOLDER_INVALID lands
+  // in v0.32 (EXP-4) when a holder doesn't match the world|brain|people/...|
+  // companies/... grammar. Wired into sync-failures.jsonl by the v0_28_0
+  // migration's phaseBBackfill (one-time backfill emission).
+  if (/TAKES_TABLE_MALFORMED|TAKES_ROW_NUM_COLLISION|TAKES_FENCE_UNBALANCED/i.test(errorMsg)) {
+    return 'TAKES_TABLE_MALFORMED';
+  }
+  if (/TAKES_HOLDER_INVALID/i.test(errorMsg)) return 'TAKES_HOLDER_INVALID';
+
   return 'UNKNOWN';
 }
 
